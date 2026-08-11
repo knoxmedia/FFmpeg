@@ -122,6 +122,7 @@ typedef struct SegmentContext {
     int   write_empty;
 
     int use_rename;
+    int segment_write_temp;
     char temp_list_filename[1024];
 
     SegmentListEntry cur_entry;
@@ -183,6 +184,46 @@ static int segment_mux_init(AVFormatContext *s)
     }
 
     return 0;
+}
+
+static int segment_use_temp(const SegmentContext *seg, const char *url)
+{
+    const char *proto;
+
+    if (!seg->segment_write_temp || !url || !url[0])
+        return 0;
+    proto = avio_find_protocol_name(url);
+    return proto && !strcmp(proto, "file");
+}
+
+static int segment_io_open(AVFormatContext *s, AVIOContext **pb, const char *url)
+{
+    SegmentContext *seg = s->priv_data;
+    char temp_filename[1024];
+
+    if (segment_use_temp(seg, url)) {
+        if (snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", url) >= sizeof(temp_filename)) {
+            av_log(s, AV_LOG_ERROR, "Segment filename too long\n");
+            return AVERROR(ENAMETOOLONG);
+        }
+        url = temp_filename;
+    }
+
+    return s->io_open(s, pb, url, AVIO_FLAG_WRITE, NULL);
+}
+
+static void segment_rename_if_temp(AVFormatContext *s, const char *url)
+{
+    SegmentContext *seg = s->priv_data;
+    char temp_filename[1024];
+
+    if (!segment_use_temp(seg, url))
+        return;
+    if (snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", url) >= sizeof(temp_filename)) {
+        av_log(s, AV_LOG_ERROR, "Segment filename too long\n");
+        return;
+    }
+    ff_rename(temp_filename, url, s);
 }
 
 static int set_segment_filename(AVFormatContext *s)
@@ -250,7 +291,7 @@ static int segment_start(AVFormatContext *s, int write_header)
     if ((err = set_segment_filename(s)) < 0)
         return err;
 
-    if ((err = s->io_open(s, &oc->pb, oc->url, AVIO_FLAG_WRITE, NULL)) < 0) {
+    if ((err = segment_io_open(s, &oc->pb, oc->url)) < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to open segment '%s'\n", oc->url);
         return err;
     }
@@ -367,6 +408,10 @@ static int segment_end(AVFormatContext *s, int write_trailer, int is_last)
         av_log(s, AV_LOG_ERROR, "Failure occurred when ending segment '%s'\n",
                oc->url);
 
+    ff_format_io_close(oc, &oc->pb);
+    if (ret >= 0)
+        segment_rename_if_temp(s, oc->url);
+
     if (seg->list) {
         if (seg->list_size || seg->list_type == LIST_TYPE_M3U8) {
             SegmentListEntry *entry = av_mallocz(sizeof(*entry));
@@ -451,8 +496,6 @@ static int segment_end(AVFormatContext *s, int write_trailer, int is_last)
     }
 
 end:
-    ff_format_io_close(oc, &oc->pb);
-
     return ret;
 }
 
@@ -767,9 +810,9 @@ static int seg_init(AVFormatContext *s)
     oc = seg->avf;
 
     if (seg->write_header_trailer) {
-        if ((ret = s->io_open(s, &oc->pb,
-                              seg->header_filename ? seg->header_filename : oc->url,
-                              AVIO_FLAG_WRITE, NULL)) < 0) {
+        if ((ret = seg->header_filename ?
+                      s->io_open(s, &oc->pb, seg->header_filename, AVIO_FLAG_WRITE, NULL) :
+                      segment_io_open(s, &oc->pb, oc->url)) < 0) {
             av_log(s, AV_LOG_ERROR, "Failed to open segment '%s'\n", oc->url);
             return ret;
         }
@@ -837,7 +880,7 @@ static int seg_write_header(AVFormatContext *s)
             close_null_ctxp(&oc->pb);
             seg->is_nullctx = 0;
         }
-        if ((ret = oc->io_open(oc, &oc->pb, oc->url, AVIO_FLAG_WRITE, NULL)) < 0)
+        if ((ret = segment_io_open(s, &oc->pb, oc->url)) < 0)
             return ret;
         if (!seg->individual_header_trailer)
             oc->pb->seekable = 0;
@@ -1075,6 +1118,7 @@ static const AVOption options[] = {
     { "reset_timestamps", "reset timestamps at the beginning of each segment", OFFSET(reset_timestamps), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
     { "initial_offset", "set initial timestamp offset", OFFSET(initial_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, -INT64_MAX, INT64_MAX, E },
     { "write_empty_segments", "allow writing empty 'filler' segments", OFFSET(write_empty), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
+    { "segment_write_temp", "write segment to temporary file and rename when complete", OFFSET(segment_write_temp), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
     { NULL },
 };
 

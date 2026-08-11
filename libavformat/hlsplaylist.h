@@ -32,6 +32,7 @@ typedef enum {
     PLAYLIST_TYPE_NONE,
     PLAYLIST_TYPE_EVENT,
     PLAYLIST_TYPE_VOD,
+    PLAYLIST_TYPE_SEGMENT,
     PLAYLIST_TYPE_NB,
 } PlaylistType;
 

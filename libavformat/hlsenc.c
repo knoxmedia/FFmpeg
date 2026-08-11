@@ -264,6 +264,54 @@ typedef struct HLSContext {
     int has_video_m3u8; /* has video stream m3u8 list */
 } HLSContext;
 
+static int hls_use_temp_file(const HLSContext *hls, const char *url, int playlist)
+{
+    const char *proto;
+
+    if (!url || !url[0])
+        return 0;
+    proto = avio_find_protocol_name(url);
+    if (!proto || strcmp(proto, "file"))
+        return 0;
+    if (hls->flags & HLS_TEMP_FILE)
+        return 1;
+    if (hls->pl_type == PLAYLIST_TYPE_SEGMENT)
+        return 1;
+    if (playlist && hls->pl_type != PLAYLIST_TYPE_VOD)
+        return 1;
+    return 0;
+}
+
+static void hls_write_segment_style_playlist(AVIOContext *out, const HLSContext *hls,
+                                             const VariantStream *vs, int64_t sequence,
+                                             int last, int subtitle)
+{
+    const HLSSegment *en;
+    double max_duration = 0;
+
+    for (en = vs->segments; en; en = en->next)
+        max_duration = FFMAX(max_duration, en->duration);
+
+    avio_printf(out, "#EXTM3U\n");
+    avio_printf(out, "#EXT-X-VERSION:3\n");
+    avio_printf(out, "#EXT-X-MEDIA-SEQUENCE:%"PRId64"\n", sequence);
+    avio_printf(out, "#EXT-X-ALLOW-CACHE:%s\n",
+                hls->allowcache == 0 ? "NO" : "YES");
+    av_log(NULL, AV_LOG_VERBOSE, "EXT-X-MEDIA-SEQUENCE:%"PRId64"\n", sequence);
+    avio_printf(out, "#EXT-X-TARGETDURATION:%"PRId64"\n", (int64_t)ceil(max_duration));
+
+    for (en = vs->segments; en; en = en->next) {
+        const char *filename = subtitle ? en->sub_filename : en->filename;
+        avio_printf(out, "#EXTINF:%f,\n", en->duration);
+        if (hls->baseurl)
+            avio_printf(out, "%s", hls->baseurl);
+        avio_printf(out, "%s\n", filename);
+    }
+
+    if (last && !(hls->flags & HLS_OMIT_ENDLIST))
+        avio_printf(out, "#EXT-X-ENDLIST\n");
+}
+
 static int strftime_expand(const char *fmt, char **dest)
 {
     int r = 1;
@@ -1177,7 +1225,7 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
     vs->last_segment = en;
 
     // EVENT or VOD playlists imply sliding window cannot be used
-    if (hls->pl_type != PLAYLIST_TYPE_NONE)
+    if (hls->pl_type == PLAYLIST_TYPE_EVENT || hls->pl_type == PLAYLIST_TYPE_VOD)
         hls->max_nb_segments = 0;
 
     if (hls->max_nb_segments && vs->nb_entries >= hls->max_nb_segments) {
@@ -1567,7 +1615,8 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
     int64_t sequence = FFMAX(hls->start_sequence, vs->sequence - vs->nb_entries);
     const char *proto = avio_find_protocol_name(vs->m3u8_name);
     int is_file_proto = proto && !strcmp(proto, "file");
-    int use_temp_file = is_file_proto && ((hls->flags & HLS_TEMP_FILE) || !(hls->pl_type == PLAYLIST_TYPE_VOD));
+    int segment_pl = hls->pl_type == PLAYLIST_TYPE_SEGMENT;
+    int use_temp_file = hls_use_temp_file(hls, vs->m3u8_name, 1);
     static unsigned warned_non_file;
     char *key_uri = NULL;
     char *iv_string = NULL;
@@ -1603,59 +1652,66 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
 
     set_http_options(s, &options, hls);
     snprintf(temp_filename, sizeof(temp_filename), use_temp_file ? "%s.tmp" : "%s", vs->m3u8_name);
-    ret = hlsenc_io_open(s, byterange_mode ? &hls->m3u8_out : &vs->out, temp_filename, &options);
+    if (segment_pl)
+        ret = hlsenc_io_open(s, &vs->out, temp_filename, &options);
+    else
+        ret = hlsenc_io_open(s, byterange_mode ? &hls->m3u8_out : &vs->out, temp_filename, &options);
     av_dict_free(&options);
     if (ret < 0) {
         goto fail;
     }
 
-    for (en = vs->segments; en; en = en->next) {
-        if (target_duration <= en->duration)
-            target_duration = lrint(en->duration);
-    }
-
-    vs->discontinuity_set = 0;
-    ff_hls_write_playlist_header(byterange_mode ? hls->m3u8_out : vs->out, hls->version, hls->allowcache,
-                                 target_duration, sequence, hls->pl_type, hls->flags & HLS_I_FRAMES_ONLY);
-
-    if ((hls->flags & HLS_DISCONT_START) && sequence==hls->start_sequence && vs->discontinuity_set==0) {
-        avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-DISCONTINUITY\n");
-        vs->discontinuity_set = 1;
-    }
-    if (vs->has_video && (hls->flags & HLS_INDEPENDENT_SEGMENTS)) {
-        avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-INDEPENDENT-SEGMENTS\n");
-    }
-    for (en = vs->segments; en; en = en->next) {
-        if ((hls->encrypt || hls->key_info_file) && (!key_uri || strcmp(en->key_uri, key_uri) ||
-                                    av_strcasecmp(en->iv_string, iv_string))) {
-            avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-KEY:METHOD=AES-128,URI=\"%s\"", en->key_uri);
-            if (*en->iv_string)
-                avio_printf(byterange_mode ? hls->m3u8_out : vs->out, ",IV=0x%s", en->iv_string);
-            avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "\n");
-            key_uri = en->key_uri;
-            iv_string = en->iv_string;
+    if (segment_pl) {
+        hls_write_segment_style_playlist(vs->out, hls, vs, sequence, last, 0);
+    } else {
+        for (en = vs->segments; en; en = en->next) {
+            if (target_duration <= en->duration)
+                target_duration = lrint(en->duration);
         }
 
-        if ((hls->segment_type == SEGMENT_TYPE_FMP4) && (en == vs->segments)) {
-            ff_hls_write_init_file(byterange_mode ? hls->m3u8_out : vs->out, (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
-                                   hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
+        vs->discontinuity_set = 0;
+        ff_hls_write_playlist_header(byterange_mode ? hls->m3u8_out : vs->out, hls->version, hls->allowcache,
+                                     target_duration, sequence, hls->pl_type, hls->flags & HLS_I_FRAMES_ONLY);
+
+        if ((hls->flags & HLS_DISCONT_START) && sequence==hls->start_sequence && vs->discontinuity_set==0) {
+            avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-DISCONTINUITY\n");
+            vs->discontinuity_set = 1;
+        }
+        if (vs->has_video && (hls->flags & HLS_INDEPENDENT_SEGMENTS)) {
+            avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-INDEPENDENT-SEGMENTS\n");
+        }
+        for (en = vs->segments; en; en = en->next) {
+            if ((hls->encrypt || hls->key_info_file) && (!key_uri || strcmp(en->key_uri, key_uri) ||
+                                        av_strcasecmp(en->iv_string, iv_string))) {
+                avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-KEY:METHOD=AES-128,URI=\"%s\"", en->key_uri);
+                if (*en->iv_string)
+                    avio_printf(byterange_mode ? hls->m3u8_out : vs->out, ",IV=0x%s", en->iv_string);
+                avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "\n");
+                key_uri = en->key_uri;
+                iv_string = en->iv_string;
+            }
+
+            if ((hls->segment_type == SEGMENT_TYPE_FMP4) && (en == vs->segments)) {
+                ff_hls_write_init_file(byterange_mode ? hls->m3u8_out : vs->out, (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
+                                       hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
+            }
+
+            ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
+                                          en->duration, hls->flags & HLS_ROUND_DURATIONS,
+                                          en->size, en->pos, hls->baseurl,
+                                          en->filename,
+                                          en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
+                                          en->keyframe_size, en->keyframe_pos, hls->flags & HLS_I_FRAMES_ONLY);
+            if (en->discont_program_date_time)
+                en->discont_program_date_time -= en->duration;
+            if (ret < 0) {
+                av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
+            }
         }
 
-        ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
-                                      en->duration, hls->flags & HLS_ROUND_DURATIONS,
-                                      en->size, en->pos, hls->baseurl,
-                                      en->filename,
-                                      en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
-                                      en->keyframe_size, en->keyframe_pos, hls->flags & HLS_I_FRAMES_ONLY);
-        if (en->discont_program_date_time)
-            en->discont_program_date_time -= en->duration;
-        if (ret < 0) {
-            av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
-        }
+        if (last && (hls->flags & HLS_OMIT_ENDLIST)==0)
+            ff_hls_write_end_list(byterange_mode ? hls->m3u8_out : vs->out);
     }
-
-    if (last && (hls->flags & HLS_OMIT_ENDLIST)==0)
-        ff_hls_write_end_list(byterange_mode ? hls->m3u8_out : vs->out);
 
     if (vs->vtt_m3u8_name) {
         set_http_options(vs->vtt_avf, &options, hls);
@@ -1665,25 +1721,36 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
         if (ret < 0) {
             goto fail;
         }
-        ff_hls_write_playlist_header(hls->sub_m3u8_out, hls->version, hls->allowcache,
-                                     target_duration, sequence, PLAYLIST_TYPE_NONE, 0);
-        for (en = vs->segments; en; en = en->next) {
-            ret = ff_hls_write_file_entry(hls->sub_m3u8_out, 0, byterange_mode,
-                                          en->duration, 0, en->size, en->pos,
-                                          hls->baseurl, en->sub_filename, NULL, 0, 0, 0);
-            if (ret < 0) {
-                av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
+        if (segment_pl) {
+            hls_write_segment_style_playlist(hls->sub_m3u8_out, hls, vs, sequence, last, 1);
+        } else {
+            for (en = vs->segments; en; en = en->next) {
+                if (target_duration <= en->duration)
+                    target_duration = lrint(en->duration);
             }
-        }
+            ff_hls_write_playlist_header(hls->sub_m3u8_out, hls->version, hls->allowcache,
+                                         target_duration, sequence, PLAYLIST_TYPE_NONE, 0);
+            for (en = vs->segments; en; en = en->next) {
+                ret = ff_hls_write_file_entry(hls->sub_m3u8_out, 0, byterange_mode,
+                                              en->duration, 0, en->size, en->pos,
+                                              hls->baseurl, en->sub_filename, NULL, 0, 0, 0);
+                if (ret < 0) {
+                    av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
+                }
+            }
 
-        if (last)
-            ff_hls_write_end_list(hls->sub_m3u8_out);
+            if (last)
+                ff_hls_write_end_list(hls->sub_m3u8_out);
+        }
 
     }
 
 fail:
     av_dict_free(&options);
-    ret = hlsenc_io_close(s, byterange_mode ? &hls->m3u8_out : &vs->out, temp_filename);
+    if (segment_pl)
+        ret = hlsenc_io_close(s, &vs->out, temp_filename);
+    else
+        ret = hlsenc_io_close(s, byterange_mode ? &hls->m3u8_out : &vs->out, temp_filename);
     if (ret < 0) {
         return ret;
     }
@@ -1706,7 +1773,6 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
     AVFormatContext *oc = vs->avf;
     AVFormatContext *vtt_oc = vs->vtt_avf;
     AVDictionary *options = NULL;
-    const char *proto = NULL;
     int use_temp_file = 0;
     char iv_string[KEYSIZE*2 + 1];
     int err = 0;
@@ -1783,8 +1849,7 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
        }
     }
 
-    proto = avio_find_protocol_name(oc->url);
-    use_temp_file = proto && !strcmp(proto, "file") && (c->flags & HLS_TEMP_FILE);
+    use_temp_file = hls_use_temp_file(c, oc->url, 0);
 
     if (use_temp_file) {
         char *new_name = av_asprintf("%s.tmp", oc->url);
@@ -2566,11 +2631,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
             if (hls->key_info_file || hls->encrypt)
                 vs->size = append_single_file(s, vs);
         } else {
-            if (oc->url[0]) {
-                proto = avio_find_protocol_name(oc->url);
-                use_temp_file = proto && !strcmp(proto, "file")
-                                      && (hls->flags & HLS_TEMP_FILE);
-            }
+            if (oc->url[0])
+                use_temp_file = hls_use_temp_file(hls, oc->url, 0);
 
             if ((hls->max_seg_size > 0 && (vs->size + vs->start_pos >= hls->max_seg_size)) || !byterange_mode) {
                 AVDictionary *options = NULL;
@@ -2847,10 +2909,8 @@ failed:
         av_dict_free(&options);
         av_freep(&filename);
         av_write_trailer(oc);
-        if (oc->url[0]) {
-            proto = avio_find_protocol_name(oc->url);
-            use_temp_file = proto && !strcmp(proto, "file") && (hls->flags & HLS_TEMP_FILE);
-        }
+        if (oc->url[0])
+            use_temp_file = hls_use_temp_file(hls, oc->url, 0);
 
         // rename that segment from .tmp to the real one
         if (use_temp_file && !(hls->flags & HLS_SINGLE_FILE)) {
@@ -3122,13 +3182,18 @@ static int hls_init(AVFormatContext *s)
             return ret;
 
         if (hls->flags & HLS_APPEND_LIST) {
-            parse_playlist(s, vs->m3u8_name, vs);
-            vs->discontinuity = 1;
-            if (hls->init_time > 0) {
-                av_log(s, AV_LOG_WARNING, "append_list mode does not support hls_init_time,"
-                       " hls_init_time value will have no effect\n");
-                hls->init_time = 0;
-                hls->recording_time = hls->time;
+            if (hls->pl_type == PLAYLIST_TYPE_SEGMENT) {
+                av_log(s, AV_LOG_WARNING, "append_list is not supported with segment playlist type, "
+                       "starting a new playlist from start_number\n");
+            } else {
+                parse_playlist(s, vs->m3u8_name, vs);
+                vs->discontinuity = 1;
+                if (hls->init_time > 0) {
+                    av_log(s, AV_LOG_WARNING, "append_list mode does not support hls_init_time,"
+                           " hls_init_time value will have no effect\n");
+                    hls->init_time = 0;
+                    hls->recording_time = hls->time;
+                }
             }
         }
 
@@ -3186,6 +3251,7 @@ static const AVOption options[] = {
     {"hls_playlist_type", "set the HLS playlist type", OFFSET(pl_type), AV_OPT_TYPE_INT, {.i64 = PLAYLIST_TYPE_NONE }, 0, PLAYLIST_TYPE_NB-1, E, .unit = "pl_type" },
     {"event", "EVENT playlist", 0, AV_OPT_TYPE_CONST, {.i64 = PLAYLIST_TYPE_EVENT }, INT_MIN, INT_MAX, E, .unit = "pl_type" },
     {"vod", "VOD playlist", 0, AV_OPT_TYPE_CONST, {.i64 = PLAYLIST_TYPE_VOD }, INT_MIN, INT_MAX, E, .unit = "pl_type" },
+    {"segment", "segment muxer compatible playlist", 0, AV_OPT_TYPE_CONST, {.i64 = PLAYLIST_TYPE_SEGMENT }, INT_MIN, INT_MAX, E, .unit = "pl_type" },
     {"method", "set the HTTP method(default: PUT)", OFFSET(method), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,    E},
     {"hls_start_number_source", "set source of first number in sequence", OFFSET(start_sequence_source_type), AV_OPT_TYPE_INT, {.i64 = HLS_START_SEQUENCE_AS_START_NUMBER }, 0, HLS_START_SEQUENCE_LAST-1, E, .unit = "start_sequence_source_type" },
     {"generic", "start_number value (default)", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_START_SEQUENCE_AS_START_NUMBER }, INT_MIN, INT_MAX, E, .unit = "start_sequence_source_type" },
